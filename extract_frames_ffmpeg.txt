@@ -1,0 +1,1 @@
+ffmpeg -i harder_challenge_video.mp4 -ss 00:00:20 -vframes 30 -vf fps=20/50 harder_frames/frame%04d.jpg -hide_banner

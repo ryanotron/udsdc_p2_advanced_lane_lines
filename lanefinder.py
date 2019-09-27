@@ -8,19 +8,22 @@ class LaneFinder:
     def __init__(self, verbose=False):
         print('Initialising LaneFinder')
         # image processing parameters
-        self.sobel_ksize = 3
-        self.sobelx_th = (16, 128)
+        self.sobel_ksize = 5
+        self.sobelx_th = (6, 12)
         self.sobelg_th = (np.pi/4-np.pi/9, np.pi/4+np.pi/9) # 45 +/- 20 [deg]
         self.canny_th = (32, 128)
         self.sat_th = (64, 255)
         self.lit_th = (175, 255)
+        self.bee_th = (150, 200)
+        self.ell_th = (200, 255)
 
         # line fit parameters
         self.nwindows = 10
         self.margin = 100 # window half-width, from current centre
-        self.minpix = 50 # minimum nonzero pixel in window for recentring
+        self.minpix = 500 # minimum nonzero pixel in window for recentring
         self.smooth = 1 # how many frames (maximum) to smooth coefficients over
         self.buffersize = 100 # how many prior coefficients to keep
+        self.hiswin = 480 # histogram y-window for sans prior lane fit
         
         # metric conversion
         self.xmppx = 3.7/700
@@ -47,7 +50,11 @@ class LaneFinder:
         self.outdir = 'output_images'
         
         self.calibrate(verbose)
+        # get perspective transform matrix and its inverse
+        self.permat = cv2.getPerspectiveTransform(self.pers_src, self.pers_dst)
+        self.invmat = cv2.getPerspectiveTransform(self.pers_dst, self.pers_src) # to reverse the perspective transform later
         self.reset()
+        
         
     def reset(self):
         self.has_prior = False
@@ -56,6 +63,7 @@ class LaneFinder:
         
         self.lcoef_metric_buffer = []
         self.rcoef_metric_buffer = []
+        
         
     def calibrate(self, verbose=False):
         calims = [os.path.join('camera_cal', fn) for fn in os.listdir('camera_cal')]
@@ -87,12 +95,15 @@ class LaneFinder:
             plt.figure(figsize=(8, 4.5));plt.imshow(dst);plt.gca().set_title('undistorted')
             plt.axis('off');plt.savefig(os.path.join(self.outdir, '01_undistorted.jpg'), bbox_inches='tight')
         
+        
     def prep_sobel(self, imud, verbose=False):
         # prepare sobel binary
         if len(imud.shape) > 2:
             grey = cv2.cvtColor(imud, cv2.COLOR_RGB2GRAY)
         else:
             grey = imud
+            
+        grey = cv2.GaussianBlur(grey, (5, 5), 0)
 
         sobelx = cv2.Sobel(grey, cv2.CV_64F, 1, 0, ksize=self.sobel_ksize)
         sobelx = np.absolute(sobelx)
@@ -103,11 +114,13 @@ class LaneFinder:
         sobely = cv2.Sobel(grey, cv2.CV_64F, 0, 1, ksize=self.sobel_ksize)
         sobely = np.absolute(sobely)
         sobely = np.uint8(255*sobely/np.max(sobely))
-        sobely_bin = np.zeros_like(sobely)
-        sobely_bin[(sobely > self.sobelx_th[0]) & (sobely <= self.sobelx_th[1])] = 1
+        #sobely_bin = np.zeros_like(sobely)
+        #sobely_bin[(sobely > self.sobelx_th[0]) & (sobely <= self.sobelx_th[1])] = 1
         
         sobelm = np.sqrt(sobelx**2 + sobely**2)
         sobelm = np.uint8(255*sobelm/np.max(sobelm))
+        #sobelm_bin = np.zeros_like(sobelm)
+        #sobelm_bin[(sobelm > self.sobelx_th[0]) & (sobelm <= self.sobelx_th[1])] = 1
 
         # find gradient
         sobelg = np.arctan2(sobely, sobelx)
@@ -116,10 +129,10 @@ class LaneFinder:
 
         if verbose: 
             plt.figure(figsize=(16, 9))
-            plt.subplot(2, 2, 1);plt.imshow(sobelx_bin, cmap='gray');plt.gca().set_title('sobel x');plt.axis('off')
-            plt.subplot(2, 2, 2);plt.imshow(sobely_bin, cmap='gray');plt.gca().set_title('sobel y');plt.axis('off')
+            plt.subplot(2, 2, 1);plt.imshow(sobelx, cmap='gray');plt.gca().set_title('sobel x');plt.axis('off')
+            plt.subplot(2, 2, 2);plt.imshow(sobely, cmap='gray');plt.gca().set_title('sobel y');plt.axis('off')
             plt.subplot(2, 2, 3);plt.imshow(sobelg_bin, cmap='gray');plt.gca().set_title('sobel gradient');plt.axis('off')
-            plt.subplot(2, 2, 4);plt.imshow(sobelm, cmap='gray');plt.gca().set_title('sobel magnitude');plt.axis('off')
+            plt.subplot(2, 2, 4);plt.imshow(sobelx_bin, cmap='gray');plt.gca().set_title('sobel binary');plt.axis('off')
             plt.savefig(os.path.join(self.outdir, '04_sobel.jpg'), bbox_inches='tight', pad_inches=0)
         
         return (sobelx_bin, sobelg_bin)
@@ -135,6 +148,42 @@ class LaneFinder:
             plt.imshow(canny, cmap='gray');plt.gca().set_title('canny')
         
         return canny//255
+    
+    
+    def prep_luv(self, imud, verbose=False):
+        imluv = cv2.cvtColor(imud, cv2.COLOR_RGB2LUV)
+        imell = imluv[:, :, 0]
+        
+        imell_bin = np.zeros_like(imell)
+        imell_bin[(imell > self.ell_th[0]) & (imell <= self.ell_th[1])] = 1
+        
+        if verbose:
+            plt.figure(figsize=(16, 9))
+            plt.subplot(2, 2, 1);plt.imshow(imluv[:, :, 0], cmap='gray');plt.gca().set_title('LUV-L');plt.axis('off')
+            plt.subplot(2, 2, 2);plt.imshow(imluv[:, :, 1], cmap='gray');plt.gca().set_title('LUV-U');plt.axis('off')
+            plt.subplot(2, 2, 3);plt.imshow(imluv[:, :, 2], cmap='gray');plt.gca().set_title('LUV-V');plt.axis('off')
+            plt.subplot(2, 2, 4);plt.imshow(imell_bin, cmap='gray');plt.gca().set_title('LUV-bin');plt.axis('off')
+            plt.savefig(os.path.join(self.outdir, '04a_luv.jpg'), bbox_inches='tight', pad_inches=0)
+            
+        return imell_bin
+    
+    
+    def prep_lab(self, imud, verbose=False):
+        imlab = cv2.cvtColor(imud, cv2.COLOR_RGB2LAB)
+        imbee = imlab[:, :, 2]
+        
+        imbee_bin = np.zeros_like(imbee)
+        imbee_bin[(imbee > self.bee_th[0]) & (imbee <= self.bee_th[1])] = 1
+        
+        if verbose:
+            plt.figure(figsize=(16, 9))
+            plt.subplot(2, 2, 1);plt.imshow(imlab[:, :, 0], cmap='gray');plt.gca().set_title('LAB-L');plt.axis('off')
+            plt.subplot(2, 2, 2);plt.imshow(imlab[:, :, 1], cmap='gray');plt.gca().set_title('LAB-A');plt.axis('off')
+            plt.subplot(2, 2, 3);plt.imshow(imlab[:, :, 2], cmap='gray');plt.gca().set_title('LAB-B');plt.axis('off')
+            plt.subplot(2, 2, 4);plt.imshow(imbee_bin, cmap='gray');plt.gca().set_title('LAB-bin');plt.axis('off')
+            plt.savefig(os.path.join(self.outdir, '04b_lab.jpg'), bbox_inches='tight', pad_inches=0)
+        
+        return imbee_bin        
         
     
     def prep_hls(self, imud, verbose=False):
@@ -164,17 +213,49 @@ class LaneFinder:
     
     
     def fit_lanes_sans_prior(self, imbird_bin, verbose=False, imout=None):
-        # find histogram for initial centres
-        ymid = imbird_bin.shape[0]//2
-        hist = np.sum(imbird_bin[ymid:, :], 0)
-
-        # calculate initial centres
+        # Find histogram for initial centres
+        # Search for initial centres start at the bottom of the image.
+        # Occasionally, no line pixels are found in either side, only noises.
+        # This will throw off the rest of the box search.
+        # We must then check the x-centres of the inital boxes against this sanity check:
+        # They must be about a regulation lane width apart: 3.7 [m].
+        # Take the first sane centres, if none found, use the whole height of image.
+        # This fallback would fail on striped lanes with high curvature,
+        # where the stripe is on the upper part of the bird-eye view perspective
+        
+        good_centres = False
+        ymax = imbird_bin.shape[0]
+        ymin = np.max((ymax - self.hiswin, 0))
         xmid = imbird_bin.shape[1]//2
-        cur_leftx = np.argmax(hist[:xmid])
-        cur_rightx = np.argmax(hist[xmid:]) + xmid
-        xmax = imbird_bin.shape[1]
+        
+        while ymin > 0:
+            hist = np.sum(imbird_bin[ymin:ymax, :], 0)
+            cur_leftx = np.argmax(hist[:xmid])
+            cur_rightx = np.argmax(hist[xmid:]) + xmid
+            
+            dx = self.xmppx*(cur_rightx - cur_leftx)
+            rt = np.abs(dx)/3.7
+            
+            if verbose:
+                print(ymin, ymax)
+                print('dx: {}, rt: {}'.format(dx/self.xmppx, rt))
+                
+            if (rt > 0.90) and (rt < 1.10):
+                good_centres = True
+                break
+            
+            ymax = np.max((0, ymax - self.hiswin//2))
+            ymin = np.max((0, ymin - self.hiswin//2))
+            
+        if not good_centres:
+            ymid = 0
+            hist = np.sum(imbird_bin[ymid:, :], 0)
 
-        # corrollaries
+            # calculate initial centres
+            cur_leftx = np.argmax(hist[:xmid])
+            cur_rightx = np.argmax(hist[xmid:]) + xmid
+        
+        xmax = imbird_bin.shape[1]
         winheight = imbird_bin.shape[0]//self.nwindows
 
         # bookkeeping
@@ -208,7 +289,7 @@ class LaneFinder:
 
             llane_idx.append(lgoed)
             rlane_idx.append(rgoed)
-
+            
             if len(lgoed) >= self.minpix:
                 cur_leftx = np.int(np.mean(nonzerox[lgoed]))
             if len(rgoed) >= self.minpix:
@@ -314,7 +395,7 @@ class LaneFinder:
     
     
     def check_sanity(self, lwidth, lcurve, rcurve, yfit):
-        ratio_width = np.abs(lwidth - 3.7)/lwidth
+        ratio_width = np.abs(lwidth - 3.7)/3.7
         
         ratio_curve = np.abs(lcurve - rcurve)/lwidth
         
@@ -325,12 +406,12 @@ class LaneFinder:
         rgrad = np.mean(2*rcoef[0]*yfit[-1:-11:-1] + rcoef[1]*yfit[-1:-11:-1])
         ratio_grad = np.abs(lgrad - rgrad)/np.max((np.abs(lgrad), np.abs(rgrad)))
         
-        sane_a = ratio_width < 0.5
-        sane_b = (ratio_curve > 0.5) and (ratio_curve < 50)
+        sane_a = ratio_width < 0.25
+        sane_b = (ratio_curve > 0.5) and (ratio_curve < 10)
         sane_c = ratio_grad < 2
         
         # two or more sanity check pass, I'll accept it
-        sane = (sane_a and sane_b) or (sane_a and sane_c) or (sane_c and sane_a)
+        sane = sane_a and (sane_b or sane_c)
         return (sane, ratio_width, ratio_curve, (lgrad, rgrad, ratio_grad))
         
     
@@ -344,28 +425,31 @@ class LaneFinder:
             plt.axis('off');plt.savefig(os.path.join(self.outdir, '03_undistorted.jpg'), bbox_inches='tight', pad_inches=0)
 
         # prepare sobel binary
-        (sobelx_bin, sobelg_bin) = self.prep_sobel(imud, verbose)
+        #(sobelm_bin, sobelg_bin) = self.prep_sobel(imud, verbose)
         
         # prepare canny
         # canny = self.prep_canny(imud, verbose)
         
         # prepare hls binary
-        (imsat_bin, imlit_bin) = self.prep_hls(imud, verbose)
+        #(imsat_bin, imlit_bin) = self.prep_hls(imud, verbose)
+        
+        # prepare lab binary
+        imlab_bin = self.prep_lab(imud, verbose)
+        
+        # prepare luv binary
+        imluv_bin = self.prep_luv(imud, verbose)
         
         # merge binaries
-        imcmb_bin = (sobelx_bin | imsat_bin | imlit_bin) & sobelg_bin
+        #imcmb_bin = (imlab_bin | imluv_bin | sobelm_bin) & sobelg_bin
+        imcmb_bin = imlab_bin | imluv_bin
 
-        ymax, xmax = imcmb_bin.shape
-        
-        # get perspective transform matrix and its inverse
-        permat = cv2.getPerspectiveTransform(self.pers_src, self.pers_dst)
-        invmat = cv2.getPerspectiveTransform(self.pers_dst, self.pers_src) # to reverse the perspective transform later
+        ymax, xmax = imcmb_bin.shape        
         
         # get bird-eye view image
-        imbird_bin = cv2.warpPerspective(imcmb_bin, permat, (xmax, ymax), flags=cv2.INTER_LINEAR)
+        imbird_bin = cv2.warpPerspective(imcmb_bin, self.permat, (xmax, ymax), flags=cv2.INTER_LINEAR)
 
         if verbose:
-            imbird = cv2.warpPerspective(imud, permat, (xmax, ymax), flags=cv2.INTER_LINEAR)
+            imbird = cv2.warpPerspective(imud, self.permat, (xmax, ymax), flags=cv2.INTER_LINEAR)
             plt.figure(figsize=(16, 4.5))
             plt.subplot(1, 2, 1);plt.imshow(imbird);plt.gca().set_title('bird-eye view')
             plt.subplot(1, 2, 2);plt.imshow(imbird_bin, cmap='gray');plt.gca().set_title('bird-eye view binary')
@@ -376,14 +460,24 @@ class LaneFinder:
         # find lane points
         if not self.has_prior or ignore_prior:
             lx, ly, rx, ry = self.fit_lanes_sans_prior(imbird_bin, verbose, imout)
+            if (len(lx)) < 1 or (len(ly) < 1) or (len(rx) < 1) or (len(ry) < 1):
+                (sobelm_bin, sobelg_bin) = self.prep_sobel(imud, verbose)
+                imcmb_bin = (imcmb_bin | sobelm_bin) & sobelg_bin
+                imbird_bin = cv2.warpPerspective(imcmb_bin, self.permat, (xmax, ymax), flags=cv2.INTER_LINEAR)
+                imout = np.dstack([imbird_bin, imbird_bin, imbird_bin])*255
+                lx, ly, rx, ry = self.fit_lanes_sans_prior(imbird_bin, verbose, imout)
         else:
             lx, ly, rx, ry = self.fit_lanes_with_prior(imbird_bin, verbose, imout)
             if (len(lx)) < 1 or (len(ly) < 1) or (len(rx) < 1) or (len(ry) < 1):
+                (sobelm_bin, sobelg_bin) = self.prep_sobel(imud, verbose)
+                imcmb_bin = (imcmb_bin | sobelm_bin) & sobelg_bin
+                imbird_bin = cv2.warpPerspective(imcmb_bin, self.permat, (xmax, ymax), flags=cv2.INTER_LINEAR)
+                imout = np.dstack([imbird_bin, imbird_bin, imbird_bin])*255
                 lx, ly, rx, ry = self.fit_lanes_sans_prior(imbird_bin, verbose, imout)
-                if (len(lx)) < 1 or (len(ly) < 1) or (len(rx) < 1) or (len(ry) < 1):
-                    cv2.putText(imud, 'FATAL FAILURE', (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                                (255, 255, 255), 2, cv2.LINE_AA)
-                    return imud
+        if (len(lx)) < 1 or (len(ly) < 1) or (len(rx) < 1) or (len(ry) < 1):
+            cv2.putText(imud, 'FATAL FAILURE', (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                        (255, 255, 255), 2, cv2.LINE_AA)
+            return imud
         
         # fit curve
         yfit, lxfit, rxfit, lcurve, rcurve, uncentre = self.fit_curve(imbird_bin, lx, ly, rx, ry)
@@ -396,6 +490,10 @@ class LaneFinder:
         # if result is not sane, try again ignoring prior
         if not sane:
             lx, ly, rx, ry = self.fit_lanes_sans_prior(imbird_bin, verbose, imout)
+            if (len(lx)) < 1 or (len(ly) < 1) or (len(rx) < 1) or (len(ry) < 1):
+                cv2.putText(imud, 'FATAL FAILURE', (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                            (255, 255, 255), 2, cv2.LINE_AA)
+                return imud
             yfit, lxfit, rxfit, lcurve, rcurve, uncentre = self.fit_curve(imbird_bin, lx, ly, rx, ry)
             lwidth = (rxfit[-1] - lxfit[-1])*self.xmppx
             sane, ratio_width, ratio_curve, xgrad = self.check_sanity(lwidth, lcurve, rcurve, yfit)
@@ -428,7 +526,7 @@ class LaneFinder:
         cv2.fillPoly(impoly, np.int_([ppts]), (0, 255, 0))
 
         # inverse perspective to camera view (undistorted)
-        impolypers = cv2.warpPerspective(impoly, invmat, (imud.shape[1], imud.shape[0]))
+        impolypers = cv2.warpPerspective(impoly, self.invmat, (imud.shape[1], imud.shape[0]))
 
         # sum images
         imsum = cv2.addWeighted(imud, 1, impolypers, 0.5, 0)

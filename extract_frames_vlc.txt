@@ -1,0 +1,1 @@
+vlc project_video.mp4 --rate 0.75 --video-filter=scene --vout=dummy --start-time=0 --stop-time=5 --scene-ratio=20 --scene-path=frames vlc://quit
